@@ -1,0 +1,66 @@
+# ======================
+# Python
+# ======================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.env
+.venv
+venv/
+ENV/
+env/
+pip-wheel-metadata/
+pip-log.txt
+
+# ======================
+# PyTorch / ML
+# ======================
+*.pt.old
+*.pth
+*.ckpt
+
+# ⚠️ NO ignores los .pt reales si los subes al repo
+# Si quieres ignorarlos, debes subirlos a otro storage y ajustar rutas
+
+# ======================
+# FastAPI / Uvicorn
+# ======================
+*.log
+uvicorn.log
+
+# ======================
+# OS
+# ======================
+.DS_Store
+Thumbs.db
+
+# ======================
+# Node / React / Vite
+# ======================
+node_modules/
+dist/
+build/
+.vite/
+.vscode/
+
+# ======================
+# Railway
+# ======================
+.railway/
+railway.toml
+
+# ======================
+# Testing / Coverage
+# ======================
+.coverage
+htmlcov/
+pytest_cache/
+
+# ======================
+# Misc
+# ======================
+*.tmp
+*.swp
+*.bak
