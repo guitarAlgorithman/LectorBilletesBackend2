@@ -16,7 +16,20 @@ Copia `.env.example` como `.env` y configura `OPENAI_API_KEY`.
 ## Railway
 
 Configura `OPENAI_API_KEY`, `OPENAI_MODEL` y `FRONTEND_ORIGINS`. El `Procfile`
-inicia Uvicorn usando el puerto entregado por Railway.
+inicia Uvicorn usando el puerto entregado por Railway. `railway.json` declara el
+comando de inicio, el healthcheck `/health` y la política de reinicio.
+
+Variables mínimas:
+
+```env
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-4o-mini
+FRONTEND_ORIGINS=https://tu-frontend.up.railway.app
+```
+
+Después del primer despliegue, genera el dominio público del backend y úsalo en
+`VITE_API_URL` del servicio frontend. Cuando Railway genere el dominio del
+frontend, vuelve aquí y configura ese dominio exacto en `FRONTEND_ORIGINS`.
 
 ## Endpoints
 
