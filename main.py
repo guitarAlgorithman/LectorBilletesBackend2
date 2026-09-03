@@ -90,6 +90,43 @@ RESULT_SCHEMA = {
     ],
 }
 
+SECURITY_INSTRUCTIONS = """
+Evalúa únicamente si en las imágenes se alcanzan a OBSERVAR elementos visuales
+compatibles con la denominación chilena indicada por el usuario. No determines
+autenticidad, no declares verdadero/falso y no inventes detalles. Compara la
+captura normal, la captura a contraluz y dos capturas desde ángulos distintos.
+Un efecto que requiera movimiento debe quedar como NO_VERIFICABLE si las fotos
+no permiten observar una diferencia clara. El tacto siempre es NO_VERIFICABLE
+POR CAMARA. Usa solo los elementos esperados incluidos en la solicitud.
+""".strip()
+
+SECURITY_SCHEMA = {
+    "type": "object", "additionalProperties": False,
+    "properties": {
+        "denominacion": {"type": "string", "enum": ["1000", "2000", "5000", "10000", "20000"]},
+        "calidad_capturas": {"type": "string", "enum": ["suficiente", "parcial", "insuficiente"]},
+        "elementos": {"type": "array", "items": {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "nombre": {"type": "string"},
+                "estado": {"type": "string", "enum": ["OBSERVADO", "NO_OBSERVADO", "NO_VERIFICABLE"]},
+                "evidencia": {"type": "string"},
+            },
+            "required": ["nombre", "estado", "evidencia"],
+        }},
+        "resumen": {"type": "string"},
+    },
+    "required": ["denominacion", "calidad_capturas", "elementos", "resumen"],
+}
+
+MIT_EXPECTED = {
+    "1000": ["Ventana transparente", "Hilo de seguridad", "Motivo coincidente", "Microtextos", "Número de serie", "Antú"],
+    "2000": ["Ventana transparente", "Hilo de seguridad", "Motivo coincidente", "Microtextos", "Número de serie", "Antú"],
+    "5000": ["Ventana transparente", "Hilo de seguridad", "Motivo coincidente", "Microtextos", "Número de serie", "Antú"],
+    "10000": ["Marca de agua", "Hilo de seguridad", "Motivo coincidente", "Microtextos", "Número de serie", "Franja 3D", "Efecto óptico variable"],
+    "20000": ["Marca de agua", "Hilo de seguridad", "Motivo coincidente", "Microtextos", "Número de serie", "Franja 3D", "Efecto óptico variable"],
+}
+
 
 class AnalyzeRequest(BaseModel):
     front_image_base64: str | None = Field(default=None, min_length=32)
@@ -121,6 +158,29 @@ class AnalysisResult(BaseModel):
     advertencia_legal: str = DISCLAIMER
 
 
+class SecurityAnalyzeRequest(BaseModel):
+    denomination: Literal["1000", "2000", "5000", "10000", "20000"]
+    normal_image_base64: str = Field(min_length=32)
+    backlight_image_base64: str | None = Field(default=None, min_length=32)
+    tilt_left_image_base64: str | None = Field(default=None, min_length=32)
+    tilt_right_image_base64: str | None = Field(default=None, min_length=32)
+
+
+class SecurityElement(BaseModel):
+    nombre: str
+    estado: Literal["OBSERVADO", "NO_OBSERVADO", "NO_VERIFICABLE"]
+    evidencia: str
+
+
+class SecurityAnalysisResult(BaseModel):
+    denominacion: Literal["1000", "2000", "5000", "10000", "20000"]
+    calidad_capturas: Literal["suficiente", "parcial", "insuficiente"]
+    elementos: list[SecurityElement]
+    resumen: str
+    autenticidad_evaluada: bool = False
+    advertencia_legal: str = "Guía visual educativa. No autentifica el billete ni sustituye una revisión presencial."
+
+
 app = FastAPI(
     title="Orientador visual de canje de billetes chilenos",
     version="2.0.0",
@@ -139,7 +199,7 @@ _requests_by_ip: dict[str, deque[float]] = defaultdict(deque)
 
 @app.middleware("http")
 async def simple_rate_limit(request: Request, call_next):
-    if request.url.path not in {"/analyze", "/predict"}:
+    if request.url.path not in {"/analyze", "/predict", "/analyze-security"}:
         return await call_next(request)
     now = time.monotonic()
     ip = request.client.host if request.client else "unknown"
@@ -218,6 +278,45 @@ def _analyse_with_openai(front: str, back: str | None) -> AnalysisResult:
         raise HTTPException(status_code=502, detail="No fue posible completar el análisis visual") from exc
 
 
+def _analyse_security_with_openai(payload: SecurityAnalyzeRequest) -> SecurityAnalysisResult:
+    images = [
+        ("CAPTURA NORMAL", payload.normal_image_base64),
+        ("CONTRALUZ", payload.backlight_image_base64),
+        ("INCLINACIÓN IZQUIERDA", payload.tilt_left_image_base64),
+        ("INCLINACIÓN DERECHA", payload.tilt_right_image_base64),
+    ]
+    content = [{"type": "input_text", "text": (
+        f"Denominación indicada: ${payload.denomination}. "
+        f"Elementos visuales esperados: {', '.join(MIT_EXPECTED[payload.denomination])}."
+    )}]
+    for label, value in images:
+        if value:
+            normalised = _normalise_image(value, label.lower())
+            content.extend([
+                {"type": "input_text", "text": f"{label}:"},
+                {"type": "input_image", "image_url": f"data:image/jpeg;base64,{normalised}", "detail": "high"},
+            ])
+    try:
+        response = _openai_client().responses.create(
+            model=OPENAI_MODEL,
+            instructions=SECURITY_INSTRUCTIONS,
+            input=[{"role": "user", "content": content}],
+            text={"format": {
+                "type": "json_schema", "name": "revision_visual_mit",
+                "strict": True, "schema": SECURITY_SCHEMA,
+            }},
+            max_output_tokens=900,
+            store=False,
+        )
+        return SecurityAnalysisResult(**json.loads(response.output_text))
+    except HTTPException:
+        raise
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="OpenAI devolvió una revisión MIT no válida") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="No fue posible completar la revisión visual MIT") from exc
+
+
 @app.get("/")
 def root():
     return {"service": "Orientador visual de canje de billetes chilenos", "version": "2.0.0", "docs": "/docs"}
@@ -235,3 +334,8 @@ def analyse_bill(payload: AnalyzeRequest):
     front = _normalise_image(payload.front_image_base64 or payload.image_base64 or "", "anverso")
     back = _normalise_image(payload.back_image_base64, "reverso") if payload.back_image_base64 else None
     return _analyse_with_openai(front, back)
+
+
+@app.post("/analyze-security", response_model=SecurityAnalysisResult)
+def analyse_security(payload: SecurityAnalyzeRequest):
+    return _analyse_security_with_openai(payload)
