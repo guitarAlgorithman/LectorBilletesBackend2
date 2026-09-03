@@ -1,487 +1,237 @@
-# app.py
-from fastapi import FastAPI
-from pydantic import BaseModel
-from pathlib import Path
-from io import BytesIO
 import base64
+import binascii
 import json
 import os
 import time
+from collections import defaultdict, deque
+from io import BytesIO
+from typing import Literal
 
-from PIL import Image
-import torch
-import torch.nn as nn
-from torchvision import models, transforms
-
-from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from openai import OpenAI
+from PIL import Image, UnidentifiedImageError
+from pydantic import BaseModel, Field, model_validator
+
 load_dotenv()
 
-from openai import OpenAI
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", str(8 * 1024 * 1024)))
+MAX_IMAGE_PIXELS = int(os.getenv("MAX_IMAGE_PIXELS", "20000000"))
+RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "10"))
+FRONTEND_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "FRONTEND_ORIGINS", os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
+    ).split(",")
+    if origin.strip()
+]
 
-# ======================
-# CONFIG (env-friendly)
-# ======================
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-UMBRAL_NINGUNA = float(os.getenv("UMBRAL_NINGUNA", "0.6"))
-
-MODEL_DENOM_PATH = Path(os.getenv("MODEL_DENOM_PATH", "modelo_denom.pt"))
-
-APTITUD_MODELS = {
-    "1000": Path(os.getenv("MODEL_APT_1000", "modelo_aptitud_1000.pt")),
-    "2000": Path(os.getenv("MODEL_APT_2000", "modelo_aptitud_2000.pt")),
-    "5000": Path(os.getenv("MODEL_APT_5000", "modelo_aptitud_5000.pt")),
-    "10000": Path(os.getenv("MODEL_APT_10000", "modelo_aptitud_10000.pt")),
-    "20000": Path(os.getenv("MODEL_APT_20000", "modelo_aptitud_20000.pt")),
-}
-DENOMS_VALIDAS = list(APTITUD_MODELS.keys())
-
-# OpenAI prompt/model desde env
-OPENAI_VISION_PROMPT = os.getenv("OPENAI_VISION_PROMPT", "").strip()
-OPENAI_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini").strip()
-OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "300"))
-
-# Healthcheck OpenAI (opcional)
-HEALTHCHECK_OPENAI = os.getenv("HEALTHCHECK_OPENAI", "0").strip() == "1"
-OPENAI_HEALTH_MODEL = os.getenv("OPENAI_HEALTH_MODEL", "gpt-4o-mini").strip()
-OPENAI_HEALTH_TIMEOUT_S = int(os.getenv("OPENAI_HEALTH_TIMEOUT_S", "8"))
-
-# ======================
-# APP + CORS
-# ======================
-app = FastAPI(title="Detector de Billetes - 2 etapas + OpenAI Vision + Health")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+DISCLAIMER = (
+    "Estimación automatizada basada únicamente en características visibles. "
+    "No autentifica el billete ni garantiza su aceptación o canje. La decisión "
+    "definitiva corresponde al Banco Central de Chile o a la entidad receptora."
 )
 
-# ======================
-# OPENAI CLIENT
-# ======================
-openai_client = OpenAI()  # requiere OPENAI_API_KEY en env
+ANALYSIS_INSTRUCTIONS = """
+Eres un asistente de evaluación VISUAL y ORIENTATIVA de billetes chilenos. No
+autentificas billetes y nunca garantizas el canje. Analiza solo lo observable en
+las fotografías y aplica estos criterios del instructivo de clasificación del
+Banco Central de Chile:
 
-def openai_vision_bill_json(image_base64: str) -> dict:
-    """
-    Llama OpenAI Vision y devuelve:
-      {"ok": True, "data": <dict>, "raw": <str>, "mode": ...}
-    o
-      {"ok": False, "error": "..."}
-    """
-    if not OPENAI_VISION_PROMPT:
-        return {"ok": False, "error": "OPENAI_VISION_PROMPT no está configurado en el entorno"}
+- POTENCIALMENTE_CANJEABLE: parece un billete chileno identificable; conserva
+  aparentemente más del 50 % de su superficie en una sola pieza y el daño
+  visible permite su revisión. Puede estar desgastado, rasgado, reparado,
+  escrito, manchado o agujereado: esos daños pueden hacerlo no apto para
+  circular, pero no necesariamente no canjeable.
+- POTENCIALMENTE_NO_CANJEABLE: hay evidencia visual clara de reconstrucción con
+  partes de billetes diferentes, entintado de seguridad, tratamiento para
+  retirar esa tinta, o no se conserva una porción identificable suficiente.
+- REQUIERE_REVISION_PRESENCIAL: fotografía insuficiente, duda relevante,
+  quemadura severa, hongos, contaminación, piezas múltiples, superficie cercana
+  al 50 %, posible falsificación o cualquier condición imposible de resolver
+  visualmente.
 
-    data_url = f"data:image/jpeg;base64,{image_base64}"
-    prompt = OPENAI_VISION_PROMPT
+No confundas "no apto para circular" con "no canjeable". No evalúes rigidez,
+tacto, fluorescencia, contaminación ni autenticidad. Si falta el reverso, puedes
+analizar el anverso, pero baja la confianza si la decisión depende de una zona no
+visible. Describe evidencia concreta y evita afirmaciones categóricas.
+""".strip()
 
-    schema = {
-        "name": "billete_chile",
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "descripcion": {"type": "string"},
-                "es_billete": {"type": "boolean"},
-                "denominacion_estimada": {
-                    "type": "string",
-                    "enum": ["1000", "2000", "5000", "10000", "20000", "ninguna"],
-                },
-                "motivos": {"type": "string"},
-            },
-            "required": ["descripcion", "es_billete", "denominacion_estimada", "motivos"],
+RESULT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "parece_billete_chileno": {"type": "boolean"},
+        "denominacion_estimada": {
+            "type": "string",
+            "enum": ["1000", "2000", "5000", "10000", "20000", "desconocida"],
         },
-    }
-
-    err_responses = None
-
-    # ---------- Intento 1: Responses API + json_schema ----------
-    try:
-        if hasattr(openai_client, "responses"):
-            r = openai_client.responses.create(
-                model=OPENAI_VISION_MODEL,
-                response_format={"type": "json_schema", "json_schema": schema},
-                input=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": prompt},
-                        {"type": "input_image", "image_url": data_url},
-                    ],
-                }],
-                max_output_tokens=OPENAI_MAX_TOKENS,
-            )
-            raw = (getattr(r, "output_text", "") or "").strip()
-            if not raw:
-                return {"ok": False, "error": "OpenAI devolvió vacío (responses)", "raw": raw, "mode": "responses_json_schema"}
-
-            # Con json_schema debería ser parseable
-            parsed = json.loads(raw)
-            return {"ok": True, "data": parsed, "raw": raw, "mode": "responses_json_schema"}
-
-    except Exception as e:
-        err_responses = f"{type(e).__name__}: {e}"
-
-    # ---------- Intento 2: Chat Completions + json_object (fallback) ----------
-    try:
-        r = openai_client.chat.completions.create(
-            model=OPENAI_VISION_MODEL,
-            response_format={"type": "json_object"},
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": data_url}},
-                ],
-            }],
-            max_tokens=OPENAI_MAX_TOKENS,
-        )
-
-        raw = (r.choices[0].message.content or "").strip()
-        if not raw:
-            return {
-                "ok": False,
-                "error": f"OpenAI devolvió vacío (chat). responses_error={err_responses}",
-                "raw": raw,
-                "mode": "chat_json_object",
-            }
-
-        parsed = json.loads(raw)
-
-        # filtro defensivo: solo 4 llaves
-        filtered = {
-            "descripcion": str(parsed.get("descripcion", "")),
-            "es_billete": bool(parsed.get("es_billete", False)),
-            "denominacion_estimada": parsed.get("denominacion_estimada", "ninguna"),
-            "motivos": str(parsed.get("motivos", "")),
-        }
-        if filtered["denominacion_estimada"] not in ["1000", "2000", "5000", "10000", "20000", "ninguna"]:
-            filtered["denominacion_estimada"] = "ninguna"
-
-        return {"ok": True, "data": filtered, "raw": raw, "mode": f"chat_json_object(responses_error={err_responses})"}
-
-    except Exception as e:
-        err_chat = f"{type(e).__name__}: {e}"
-        return {"ok": False, "error": f"OpenAI failed. responses_error={err_responses} | chat_error={err_chat}"}
-
-# ======================
-# TRANSFORMS
-# ======================
-infer_tf = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225],
-    ),
-])
-
-# ======================
-# LOAD MODELS (startup)
-# ======================
-denom_model = None
-class_names_denom = []
-
-print(f"📌 Cargando modelo de denominación en {DEVICE}...")
-try:
-    if not MODEL_DENOM_PATH.exists():
-        raise FileNotFoundError(f"No existe {MODEL_DENOM_PATH}")
-
-    ckpt_denom = torch.load(MODEL_DENOM_PATH, map_location=DEVICE)
-    class_names_denom = ckpt_denom["classes"]
-
-    denom_model = models.resnet18(weights=None)
-    denom_model.fc = nn.Linear(denom_model.fc.in_features, len(class_names_denom))
-    denom_model.load_state_dict(ckpt_denom["state_dict"])
-    denom_model.to(DEVICE)
-    denom_model.eval()
-
-    print("✔️ Modelo de denominación cargado.")
-    print("   Clases:", class_names_denom)
-
-except Exception as e:
-    print(f"❌ Error cargando modelo de denominación: {type(e).__name__}: {e}")
-
-apto_models = {}
-
-def load_apto_model(weights_path: Path):
-    model = models.resnet18(weights=None)
-    model.fc = nn.Linear(model.fc.in_features, 2)
-
-    state = torch.load(weights_path, map_location=DEVICE)
-    if isinstance(state, dict) and "state_dict" in state:
-        state = state["state_dict"]
-
-    model.load_state_dict(state)
-    model.to(DEVICE)
-    model.eval()
-    return model
-
-print("📌 Cargando modelos de aptitud...")
-for denom, path in APTITUD_MODELS.items():
-    try:
-        if path.exists():
-            apto_models[denom] = load_apto_model(path)
-            print(f"   ✔ {denom} -> {path}")
-        else:
-            print(f"   ⚠ NO se encontró modelo de aptitud para {denom}: {path}")
-    except Exception as e:
-        print(f"   ❌ Error cargando aptitud {denom} ({path}): {type(e).__name__}: {e}")
-print("✔️ Modelos de aptitud listos (si existen).")
-
-# ======================
-# SCHEMAS
-# ======================
-class PredictRequest(BaseModel):
-    image_base64: str
-
-# ======================
-# HELPERS
-# ======================
-def decode_image_from_base64(b64_str: str) -> Image.Image:
-    img_bytes = base64.b64decode(b64_str)
-    return Image.open(BytesIO(img_bytes)).convert("RGB")
-
-def infer_denominacion(img: Image.Image):
-    """
-    Devuelve:
-      denom_final: '1000'...'20000' o 'ninguna'
-      denom_pred: salida cruda
-      prob_max: confianza de la clase predicha
-      probs: lista probs
-    """
-    if denom_model is None or not class_names_denom:
-        raise RuntimeError("Modelo de denominación no está cargado")
-
-    x = infer_tf(img).unsqueeze(0).to(DEVICE)
-    with torch.no_grad():
-        logits = denom_model(x)
-        probs = torch.softmax(logits, dim=1)[0]
-
-    prob_max, idx = torch.max(probs, dim=0)
-    prob_max = prob_max.item()
-    denom_pred = class_names_denom[idx.item()]
-
-    denom_final = "ninguna" if (denom_pred == "desconocido" or prob_max < UMBRAL_NINGUNA) else denom_pred
-    return denom_final, denom_pred, prob_max, probs.cpu().numpy().tolist()
-
-def infer_aptitud(img: Image.Image, denom: str):
-    if denom not in apto_models:
-        return None, None, None
-
-    model = apto_models[denom]
-    x = infer_tf(img).unsqueeze(0).to(DEVICE)
-
-    with torch.no_grad():
-        logits = model(x)
-        probs = torch.softmax(logits, dim=1)[0]
-
-    prob_max, idx = torch.max(probs, dim=0)
-    prob_max = prob_max.item()
-
-    # IMPORTANTE: tu convención fue idx 0 = apto, idx 1 = no_apto
-    clase = "apto" if idx.item() == 0 else "no_apto"
-    return clase, prob_max, probs.cpu().numpy().tolist()
-
-# ======================
-# HEALTH HELPERS
-# ======================
-def _check_models_loaded() -> dict:
-    out = {
-        "denom_model": {
-            "loaded": denom_model is not None,
-            "path": str(MODEL_DENOM_PATH),
-            "exists": MODEL_DENOM_PATH.exists(),
-            "classes": class_names_denom,
+        "resultado": {
+            "type": "string",
+            "enum": [
+                "POTENCIALMENTE_CANJEABLE",
+                "POTENCIALMENTE_NO_CANJEABLE",
+                "REQUIERE_REVISION_PRESENCIAL",
+            ],
         },
-        "aptitud_models": {},
-        "all_required_apt_loaded": True,
-        "any_apt_loaded": False,
-    }
+        "confianza_visual": {"type": "string", "enum": ["alta", "media", "baja"]},
+        "danos_visibles": {"type": "array", "items": {"type": "string"}},
+        "evidencia": {"type": "array", "items": {"type": "string"}},
+        "motivo": {"type": "string"},
+        "requiere_revision_presencial": {"type": "boolean"},
+    },
+    "required": [
+        "parece_billete_chileno", "denominacion_estimada", "resultado",
+        "confianza_visual", "danos_visibles", "evidencia", "motivo",
+        "requiere_revision_presencial",
+    ],
+}
 
-    for denom, path in APTITUD_MODELS.items():
-        loaded = denom in apto_models
-        exists = path.exists()
-        out["aptitud_models"][denom] = {
-            "loaded": loaded,
-            "path": str(path),
-            "exists": exists,
-        }
-        if loaded:
-            out["any_apt_loaded"] = True
-        if not exists or (exists and not loaded):
-            out["all_required_apt_loaded"] = False
 
-    return out
+class AnalyzeRequest(BaseModel):
+    front_image_base64: str | None = Field(default=None, min_length=32)
+    back_image_base64: str | None = Field(default=None, min_length=32)
+    image_base64: str | None = Field(default=None, min_length=32)
 
-def _check_openai() -> dict:
-    key_present = bool(os.getenv("OPENAI_API_KEY", "").strip())
-    out = {
-        "api_key_present": key_present,
-        "prompt_configured": bool(OPENAI_VISION_PROMPT),
-        "model": OPENAI_VISION_MODEL,
-        "has_responses_api": hasattr(openai_client, "responses"),
-        "deep_check_enabled": HEALTHCHECK_OPENAI,
-        "ok": False,
-    }
+    @model_validator(mode="after")
+    def require_an_image(self):
+        if not (self.front_image_base64 or self.image_base64):
+            raise ValueError("Debes enviar front_image_base64 o image_base64")
+        return self
 
-    if not key_present:
-        out["error"] = "OPENAI_API_KEY no está configurada"
-        return out
 
-    # superficial OK si hay key
-    out["ok"] = True
+class AnalysisResult(BaseModel):
+    parece_billete_chileno: bool
+    denominacion_estimada: Literal["1000", "2000", "5000", "10000", "20000", "desconocida"]
+    resultado: Literal[
+        "POTENCIALMENTE_CANJEABLE", "POTENCIALMENTE_NO_CANJEABLE",
+        "REQUIERE_REVISION_PRESENCIAL",
+    ]
+    confianza_visual: Literal["alta", "media", "baja"]
+    danos_visibles: list[str]
+    evidencia: list[str]
+    motivo: str
+    requiere_revision_presencial: bool
+    es_estimacion_visual: bool = True
+    autenticidad_evaluada: bool = False
+    canje_garantizado: bool = False
+    advertencia_legal: str = DISCLAIMER
 
-    if not HEALTHCHECK_OPENAI:
-        return out
 
-    # deep check: llamada mínima (barata)
-    t0 = time.time()
-    try:
-        if hasattr(openai_client, "responses"):
-            r = openai_client.responses.create(
-                model=OPENAI_HEALTH_MODEL,
-                input="Responde SOLO 'ok'.",
-                max_output_tokens=5,
-            )
-            txt = (getattr(r, "output_text", "") or "").strip().lower()
-            out["latency_ms"] = int((time.time() - t0) * 1000)
-            out["ok"] = ("ok" in txt)
-            out["mode"] = "responses"
-            out["raw"] = txt[:50]
-            if not out["ok"]:
-                out["error"] = "Respuesta inesperada (deep check responses)"
-            return out
+app = FastAPI(
+    title="Orientador visual de canje de billetes chilenos",
+    version="2.0.0",
+    description="Evaluación visual orientativa mediante OpenAI; no autentifica ni garantiza canje.",
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=FRONTEND_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type"],
+)
 
-        r = openai_client.chat.completions.create(
-            model=OPENAI_HEALTH_MODEL,
-            messages=[{"role": "user", "content": "Responde SOLO 'ok'."}],
-            max_tokens=5,
+_requests_by_ip: dict[str, deque[float]] = defaultdict(deque)
+
+
+@app.middleware("http")
+async def simple_rate_limit(request: Request, call_next):
+    if request.url.path not in {"/analyze", "/predict"}:
+        return await call_next(request)
+    now = time.monotonic()
+    ip = request.client.host if request.client else "unknown"
+    bucket = _requests_by_ip[ip]
+    while bucket and now - bucket[0] > 60:
+        bucket.popleft()
+    if len(bucket) >= RATE_LIMIT_PER_MINUTE:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Demasiadas consultas. Intenta nuevamente en un minuto."},
         )
-        txt = (r.choices[0].message.content or "").strip().lower()
-        out["latency_ms"] = int((time.time() - t0) * 1000)
-        out["ok"] = ("ok" in txt)
-        out["mode"] = "chat.completions"
-        out["raw"] = txt[:50]
-        if not out["ok"]:
-            out["error"] = "Respuesta inesperada (deep check chat)"
-        return out
+    bucket.append(now)
+    return await call_next(request)
 
-    except Exception as e:
-        out["latency_ms"] = int((time.time() - t0) * 1000)
-        out["ok"] = False
-        out["error"] = f"{type(e).__name__}: {e}"
-        return out
 
-# ======================
-# ENDPOINTS
-# ======================
+def _openai_client() -> OpenAI:
+    if not os.getenv("OPENAI_API_KEY", "").strip():
+        raise HTTPException(status_code=503, detail="OPENAI_API_KEY no está configurada")
+    return OpenAI()
+
+
+def _normalise_image(value: str, label: str) -> str:
+    encoded = value.split(",", 1)[1] if value.startswith("data:") and "," in value else value
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"{label}: base64 inválido") from exc
+    if not raw or len(raw) > MAX_IMAGE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"{label}: la imagen excede el máximo de {MAX_IMAGE_BYTES // (1024 * 1024)} MB",
+        )
+    try:
+        with Image.open(BytesIO(raw)) as image:
+            image.load()
+            if image.width * image.height > MAX_IMAGE_PIXELS:
+                raise HTTPException(status_code=413, detail=f"{label}: demasiados píxeles")
+            image = image.convert("RGB")
+            image.thumbnail((2400, 2400))
+            output = BytesIO()
+            image.save(output, format="JPEG", quality=88, optimize=True)
+    except (UnidentifiedImageError, OSError) as exc:
+        raise HTTPException(status_code=422, detail=f"{label}: archivo de imagen inválido") from exc
+    return base64.b64encode(output.getvalue()).decode("ascii")
+
+
+def _analyse_with_openai(front: str, back: str | None) -> AnalysisResult:
+    content = [
+        {"type": "input_text", "text": "Analiza el anverso y, si existe, el reverso del mismo billete."},
+        {"type": "input_text", "text": "ANVERSO:"},
+        {"type": "input_image", "image_url": f"data:image/jpeg;base64,{front}", "detail": "high"},
+    ]
+    if back:
+        content.extend([
+            {"type": "input_text", "text": "REVERSO:"},
+            {"type": "input_image", "image_url": f"data:image/jpeg;base64,{back}", "detail": "high"},
+        ])
+    try:
+        response = _openai_client().responses.create(
+            model=OPENAI_MODEL,
+            instructions=ANALYSIS_INSTRUCTIONS,
+            input=[{"role": "user", "content": content}],
+            text={"format": {
+                "type": "json_schema", "name": "evaluacion_canje_billete",
+                "strict": True, "schema": RESULT_SCHEMA,
+            }},
+            max_output_tokens=700,
+            store=False,
+        )
+        return AnalysisResult(**json.loads(response.output_text))
+    except HTTPException:
+        raise
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="OpenAI devolvió un resultado no válido") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="No fue posible completar el análisis visual") from exc
+
+
 @app.get("/")
 def root():
-    return {"info": "API billetes 2 etapas OK + OpenAI + Health"}
+    return {"service": "Orientador visual de canje de billetes chilenos", "version": "2.0.0", "docs": "/docs"}
+
 
 @app.get("/health")
 def health():
-    models_status = _check_models_loaded()
-    openai_status = _check_openai()
+    configured = bool(os.getenv("OPENAI_API_KEY", "").strip())
+    return {"ok": configured, "model": OPENAI_MODEL, "openai_key_configured": configured}
 
-    # criterio: denom cargado + existe + al menos 1 aptitud cargado
-    ok_models = (
-        models_status["denom_model"]["loaded"]
-        and models_status["denom_model"]["exists"]
-        and models_status["any_apt_loaded"]
-    )
-    ok = ok_models and openai_status["ok"]
 
-    return {
-        "ok": ok,
-        "device": DEVICE,
-        "umbral_ninguna": UMBRAL_NINGUNA,
-        "models": models_status,
-        "openai": openai_status,
-    }
-
-@app.get("/debug-models")
-def debug_models():
-    return {
-        "device": DEVICE,
-        "umbral_ninguna": UMBRAL_NINGUNA,
-        "openai": {
-            "model": OPENAI_VISION_MODEL,
-            "prompt_configurado": bool(OPENAI_VISION_PROMPT),
-            "prompt_len": len(OPENAI_VISION_PROMPT),
-            "prompt_head": OPENAI_VISION_PROMPT[:80],
-            "has_responses_api": hasattr(openai_client, "responses"),
-        },
-        "modelo_denominacion": {
-            "ruta": str(MODEL_DENOM_PATH),
-            "exists": MODEL_DENOM_PATH.exists(),
-            "clases": class_names_denom,
-            "estado": "cargado" if denom_model is not None else "no cargado",
-        },
-        "modelos_aptitud": {
-            denom: {"cargado": (denom in apto_models), "ruta": str(path), "exists": path.exists()}
-            for denom, path in APTITUD_MODELS.items()
-        },
-    }
-
-@app.post("/predict")
-def predict_final(req: PredictRequest):
-    # 1) decode
-    try:
-        img = decode_image_from_base64(req.image_base64)
-    except Exception:
-        oa = openai_vision_bill_json(req.image_base64)
-        return {
-            "denominacion": "ninguna",
-            "apto": None,
-            "confianza": 0.0,
-            "detalle": "Base64 inválido o imagen corrupta",
-            "openai": oa,
-        }
-
-    # 2) denom
-    try:
-        denom_final, denom_model_out, prob_denom, probs_denom = infer_denominacion(img)
-    except Exception as e:
-        oa = openai_vision_bill_json(req.image_base64)
-        return {
-            "denominacion": "ninguna",
-            "apto": None,
-            "confianza": 0.0,
-            "detalle": f"Error en modelo de denominación: {type(e).__name__}: {e}",
-            "openai": oa,
-        }
-
-    # 3) aptitud
-    apto_bool = None
-    confianza = float(prob_denom)
-    detalle = "OK"
-
-    if denom_final == "ninguna" or denom_final not in DENOMS_VALIDAS:
-        detalle = "No se detectó una denominación válida"
-    else:
-        clase_apto, prob_apto, _ = infer_aptitud(img, denom_final)
-        if clase_apto is None:
-            detalle = "Modelo de aptitud no disponible para esta denominación"
-        else:
-            apto_bool = (clase_apto == "apto")
-            confianza = float(prob_apto)
-
-    # 4) openai always
-    oa = openai_vision_bill_json(req.image_base64)
-
-    return {
-        "denominacion": denom_final,
-        "apto": apto_bool,
-        "confianza": confianza,
-        "detalle": detalle,
-
-        # debug (déjalo mientras pruebas; bórralo si quieres)
-        "denominacion_modelo": denom_model_out,
-        "prob_denom": float(prob_denom),
-        "probs_denom": probs_denom,
-
-        "openai": oa,
-    }
+@app.post("/analyze", response_model=AnalysisResult)
+@app.post("/predict", response_model=AnalysisResult, include_in_schema=False)
+def analyse_bill(payload: AnalyzeRequest):
+    front = _normalise_image(payload.front_image_base64 or payload.image_base64 or "", "anverso")
+    back = _normalise_image(payload.back_image_base64, "reverso") if payload.back_image_base64 else None
+    return _analyse_with_openai(front, back)

@@ -8,6 +8,8 @@ __pycache__/
 .Python
 .env
 .venv
+.venv*/
+.testenv/
 venv/
 ENV/
 env/
@@ -17,12 +19,12 @@ pip-log.txt
 # ======================
 # PyTorch / ML
 # ======================
+*.pt
 *.pt.old
 *.pth
 *.ckpt
 
-# ⚠️ NO ignores los .pt reales si los subes al repo
-# Si quieres ignorarlos, debes subirlos a otro storage y ajustar rutas
+# La versión 2 usa exclusivamente OpenAI Vision y no distribuye pesos locales.
 
 # ======================
 # FastAPI / Uvicorn
