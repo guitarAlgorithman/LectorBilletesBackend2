@@ -164,6 +164,7 @@ class SecurityAnalyzeRequest(BaseModel):
     backlight_image_base64: str | None = Field(default=None, min_length=32)
     tilt_left_image_base64: str | None = Field(default=None, min_length=32)
     tilt_right_image_base64: str | None = Field(default=None, min_length=32)
+    uv_image_base64: str | None = Field(default=None, min_length=32)
 
 
 class SecurityElement(BaseModel):
@@ -284,10 +285,12 @@ def _analyse_security_with_openai(payload: SecurityAnalyzeRequest) -> SecurityAn
         ("CONTRALUZ", payload.backlight_image_base64),
         ("INCLINACIÓN IZQUIERDA", payload.tilt_left_image_base64),
         ("INCLINACIÓN DERECHA", payload.tilt_right_image_base64),
+        ("LUZ ULTRAVIOLETA OPCIONAL", payload.uv_image_base64),
     ]
     content = [{"type": "input_text", "text": (
         f"Denominación indicada: ${payload.denomination}. "
-        f"Elementos visuales esperados: {', '.join(MIT_EXPECTED[payload.denomination])}."
+        f"Elementos visuales esperados: {', '.join(MIT_EXPECTED[payload.denomination])}. "
+        f"{'Incluye captura UV: evalúa también número UV o fluorescencia.' if payload.uv_image_base64 else 'No incluye captura UV: no agregues ni penalices elementos UV.'}"
     )}]
     for label, value in images:
         if value:
