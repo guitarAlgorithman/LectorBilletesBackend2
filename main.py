@@ -167,6 +167,13 @@ class SecurityAnalyzeRequest(BaseModel):
     uv_image_base64: str | None = Field(default=None, min_length=32)
 
 
+class SecurityViewRequest(BaseModel):
+    denomination: Literal["1000", "2000", "5000", "10000", "20000"]
+    view: Literal["normal", "backlight", "tilt", "uv"]
+    image_base64: str = Field(min_length=32)
+    reference_image_base64: str | None = Field(default=None, min_length=32)
+
+
 class SecurityElement(BaseModel):
     nombre: str
     estado: Literal["OBSERVADO", "NO_OBSERVADO", "NO_VERIFICABLE"]
@@ -200,7 +207,7 @@ _requests_by_ip: dict[str, deque[float]] = defaultdict(deque)
 
 @app.middleware("http")
 async def simple_rate_limit(request: Request, call_next):
-    if request.url.path not in {"/analyze", "/predict", "/analyze-security"}:
+    if request.url.path not in {"/analyze", "/predict", "/analyze-security", "/analyze-security-view"}:
         return await call_next(request)
     now = time.monotonic()
     ip = request.client.host if request.client else "unknown"
@@ -320,6 +327,57 @@ def _analyse_security_with_openai(payload: SecurityAnalyzeRequest) -> SecurityAn
         raise HTTPException(status_code=502, detail="No fue posible completar la revisión visual MIT") from exc
 
 
+def _analyse_security_view_with_openai(payload: SecurityViewRequest) -> SecurityAnalysisResult:
+    expected_by_view = {
+        "normal": {
+            "1000": ["Ventana transparente", "Microtextos", "Número de serie"],
+            "2000": ["Ventana transparente", "Microtextos", "Número de serie"],
+            "5000": ["Ventana transparente", "Microtextos", "Número de serie"],
+            "10000": ["Marca de agua", "Microtextos", "Número de serie"],
+            "20000": ["Marca de agua", "Microtextos", "Número de serie"],
+        },
+        "backlight": {key: ["Hilo de seguridad", "Motivo coincidente"] for key in MIT_EXPECTED},
+        "tilt": {
+            "1000": ["Antú"], "2000": ["Antú"], "5000": ["Antú"],
+            "10000": ["Franja 3D", "Efecto óptico variable"],
+            "20000": ["Franja 3D", "Efecto óptico variable"],
+        },
+        "uv": {key: ["Número UV o fluorescencia"] for key in MIT_EXPECTED},
+    }
+    expected = expected_by_view[payload.view][payload.denomination]
+    current = _normalise_image(payload.image_base64, "captura")
+    content = [
+        {"type": "input_text", "text": (
+            f"Analiza solo la vista {payload.view} del billete chileno de ${payload.denomination}. "
+            f"Devuelve exactamente un resultado por cada elemento de esta lista: {', '.join(expected)}. "
+            "Usa NO_VERIFICABLE cuando la calidad o esta vista no permitan comprobarlo."
+        )},
+        {"type": "input_image", "image_url": f"data:image/jpeg;base64,{current}", "detail": "high"},
+    ]
+    if payload.reference_image_base64:
+        reference = _normalise_image(payload.reference_image_base64, "captura de referencia")
+        content.extend([
+            {"type": "input_text", "text": "CAPTURA DEL OTRO ÁNGULO PARA COMPARACIÓN:"},
+            {"type": "input_image", "image_url": f"data:image/jpeg;base64,{reference}", "detail": "high"},
+        ])
+    try:
+        response = _openai_client().responses.create(
+            model=OPENAI_MODEL,
+            instructions=SECURITY_INSTRUCTIONS,
+            input=[{"role": "user", "content": content}],
+            text={"format": {"type": "json_schema", "name": "revision_vista_mit", "strict": True, "schema": SECURITY_SCHEMA}},
+            max_output_tokens=650,
+            store=False,
+        )
+        return SecurityAnalysisResult(**json.loads(response.output_text))
+    except HTTPException:
+        raise
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="OpenAI devolvió una revisión de vista no válida") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="No fue posible analizar esta vista") from exc
+
+
 @app.get("/")
 def root():
     return {"service": "Orientador visual de canje de billetes chilenos", "version": "2.0.0", "docs": "/docs"}
@@ -342,3 +400,8 @@ def analyse_bill(payload: AnalyzeRequest):
 @app.post("/analyze-security", response_model=SecurityAnalysisResult)
 def analyse_security(payload: SecurityAnalyzeRequest):
     return _analyse_security_with_openai(payload)
+
+
+@app.post("/analyze-security-view", response_model=SecurityAnalysisResult)
+def analyse_security_view(payload: SecurityViewRequest):
+    return _analyse_security_view_with_openai(payload)
